@@ -1,0 +1,91 @@
+from common import *
+import sys
+
+from ranx import Run, fuse
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+bi_encoder = SentenceTransformer(bi_encoder, device='cuda:0')
+
+model_id = 'Qwen/Qwen2.5-3B-Instruct'
+model = AutoModelForCausalLM.from_pretrained(model_id, device_map='cuda')
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+llmPrompt = 'Answer the following query with a single paragraph.'
+
+llmMessages = [
+    {'role': 'system', 'content': llmPrompt},
+    {'role': 'user', 'content': ''}
+]
+
+def create_llm_text(queries):
+    newQueries = []
+    for q in queries:
+        llmMessages[-1]['content'] = q
+        inputText = tokenizer.apply_chat_template(
+            llmMessages,
+            tokenize=False,
+            temperature=0.5,
+            add_generation_prompt=True
+        )
+        encodedInputs = tokenizer(inputText,
+                                  return_tensors='pt').to('cuda')
+        outputs = model.generate(**encodedInputs,
+                                 max_new_tokens=512)
+        newText = tokenizer.batch_decode(
+            outputs[:, encodedInputs.input_ids.shape[1]:])[0]
+        newQueries.append(newText)
+        
+    return newQueries
+
+def create_ranx_run(qids, docids, searchResults, name):
+    runDict = {}
+    for i in range(len(qids)):
+        qid = qids[i]
+        runDict[qid] = {}
+        for r in searchResults[i]:
+            runDict[qid][docids[r['corpus_id']]] = r['score']
+
+    return Run(runDict, name=name)
+
+def main():
+    queries = read_topic_file(sys.argv[1])
+    qText = [q['text'] for qid, q in queries.items()]
+    qids = [qid for qid, q in queries.items()]
+    qrel = read_qrel_file('qrel_1.tsv')
+    collection = read_collection_file('Answers.json')
+    colText = [doc for docid, doc in collection.items()]
+    docids = [docid for docid, doc in collection.items()]
+    
+    llmText = create_llm_text(qText)
+    print('Finished creating llm queries', flush=True)
+    
+    qEmbed = bi_encoder.encode(qText, device='cuda:0')
+    llmEmbed = bi_encoder.encode(llmText, device='cuda:0')
+    colEmbed = bi_encoder.encode(colText, device='cuda:0')
+
+    print('Finished creating embeddings', flush=True)
+
+    qRun = create_ranx_run(qids, docids, util.semantic_search(qEmbed,
+                                                              colEmbed,
+                                                              top_k=100),
+                           'query_run')
+    llmRun = create_ranx_run(qids, docids, util.semantic_search(llmEmbed,
+                                                                colEmbed,
+                                                                top_k=100),
+                             'llm_run')
+    
+    # Convert run into a list of lists.
+    fusedRun = [list(qR) for qR in
+                list(fuse(runs=[qRun, llmRun], norm=None,
+                          method='max').to_dict().items())]
+    # Sort each list of results by score and take the top 100 from each.
+    for qResults in fusedRun:
+        qResults[1] = dict(sorted([list(r) for r in list(qResults[1].items())],
+                                  key=lambda r: r[1],
+                                  reverse=True)[:100])
+    # Convert back into a Ranx run and save results.
+    fusedRun = Run(dict(fusedRun), name='res_final')
+    fusedRun.save('res_final.tsv', kind='trec')
+                                    
+if __name__ == '__main__':
+    main()
